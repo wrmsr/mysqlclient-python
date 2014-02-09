@@ -74,6 +74,14 @@ typedef struct {
 	MYSQL connection;
 	int open;
 	PyObject *converter;
+        /* nonblocking requires the query body stay in memory during execution */
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+        PyObject *current_nonblocking_query;
+        PyObject *current_nonblocking_host;
+        PyObject *current_nonblocking_username;
+        PyObject *current_nonblocking_password;
+        PyObject *current_nonblocking_dbname;
+#endif
 } _mysql_ConnectionObject;
 
 #define check_connection(c) if (!(c->open)) return _mysql_Exception(c)
@@ -545,18 +553,18 @@ _mysql_ConnectionObject_Initialize(
 				  "read_default_file", "read_default_group",
 				  "client_flag", "ssl",
 				  "local_infile",
-#ifdef HAVE_MYSQL_OPT_TIMEOUTS
-				  "read_timeout",
-				  "write_timeout",
-#endif
+                                  "read_timeout",
+                                  "write_timeout",
+                                  "nonblocking",
 #ifdef HAVE_MYSQL_CONNECTION_ATTRIBUTES
 				  "connection_attributes",
 #endif
 				  NULL } ;
 	int connect_timeout = 0;
 #ifdef HAVE_MYSQL_OPT_TIMEOUTS
-	int read_timeout = 0;
-	int write_timeout = 0;
+        int read_timeout = 0;
+        int write_timeout = 0;
+        int nonblocking = 0;
 #endif
 	int compress = -1, named_pipe = -1, local_infile = -1;
 	char *init_command=NULL,
@@ -565,13 +573,19 @@ _mysql_ConnectionObject_Initialize(
 	
 	self->converter = NULL;
 	self->open = 0;
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+	self->current_nonblocking_username = NULL;
+	self->current_nonblocking_password = NULL;
+	self->current_nonblocking_host = NULL;
+	self->current_nonblocking_dbname = NULL;
+#endif
 	check_server_init(-1);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwargs,
 #ifdef HAVE_MYSQL_CONNECTION_ATTRIBUTES
-                                         "|ssssisOiiisssiOiiiO:connect",
+                                         "|ssssisOiiisssiOiiiiO:connect",
 #elif HAVE_MYSQL_OPT_TIMEOUTS
-                                         "|ssssisOiiisssiOiii:connect",
+                                         "|ssssisOiiisssiOiiii:connect",
 #else
                                          "|ssssisOiiisssiOi:connect",
 #endif
@@ -587,6 +601,7 @@ _mysql_ConnectionObject_Initialize(
 #ifdef HAVE_MYSQL_OPT_TIMEOUTS
                      , &read_timeout
                      , &write_timeout
+                     , &nonblocking
 #endif
 #ifdef HAVE_MYSQL_CONNECTION_ATTRIBUTES
                      , &connection_attributes
@@ -678,8 +693,43 @@ _mysql_ConnectionObject_Initialize(
 			      key, cert, ca, capath, cipher);
 #endif
 
-	conn = mysql_real_connect(&(self->connection), host, user, passwd, db,
-				  port, unix_socket, client_flag);
+	if (!nonblocking) {
+	  conn = mysql_real_connect(&(self->connection), host, user, passwd, db,
+				    port, unix_socket, client_flag);
+	} else {
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+	  /* We need our string parameters to be valid throughout the
+	     nonblocking connect, like the query, so we create objects
+	     to hold the reference. It would be cleaner to just keep
+	     the objects passed in from the function but that would
+	     make the diff less localized. */
+	  if (user) {
+	    self->current_nonblocking_username = PyString_FromString(user);
+	    user = PyString_AsString(self->current_nonblocking_username);
+	  }
+
+	  if (host) {
+	    self->current_nonblocking_host = PyString_FromString(host);
+	    host = PyString_AsString(self->current_nonblocking_host);
+	  }
+
+	  if (passwd) {
+	    self->current_nonblocking_password = PyString_FromString(passwd);
+	    passwd = PyString_AsString(self->current_nonblocking_password);
+	  }
+
+	  if (db) {
+	    self->current_nonblocking_dbname = PyString_FromString(db);
+	    db = PyString_AsString(self->current_nonblocking_dbname);
+	  }
+
+	  int res = mysql_real_connect_nonblocking_init(&(self->connection), host, user, passwd, db,
+							port, unix_socket, client_flag);
+	  if (!res) {
+	    conn = NULL;
+	  }
+#endif
+	}
 
 	Py_END_ALLOW_THREADS ;
 
@@ -1132,6 +1182,58 @@ _mysql_escape_string(
 	return (str);
 }
 
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+static char _mysql_nonblocking_connect_run__doc__[] = 
+  "Call repeatedly to continue on the nonblocking connect.  Returns a\n"
+  "net_async_status of either NET_ASYNC_COMPLETE or NET_ASYNC_NOT_READY.\n";
+
+static PyObject *
+_mysql_nonblocking_connect_run(
+	_mysql_ConnectionObject *self,
+	PyObject *args)
+{
+	net_async_status status;
+	int error;
+
+	if (!PyArg_ParseTuple(args, "")) return NULL;
+	status = mysql_real_connect_nonblocking_run(&(self->connection), &error);
+
+	if (status == NET_ASYNC_COMPLETE) {
+	  if (error) {
+	    return _mysql_Exception(self);
+	  }
+	}
+
+        return PyInt_FromLong(status);
+}
+
+static char _mysql_get_file_descriptor__doc__[] =
+  "Return the file descriptor of the connection for use with nonblocking socket\n"
+  "operations.";
+
+static PyObject *
+_mysql_get_file_descriptor(
+	_mysql_ConnectionObject *self,
+	PyObject *args)
+{
+	if (!PyArg_ParseTuple(args, "")) return NULL;
+        return PyInt_FromLong(mysql_get_file_descriptor(&(self->connection)));
+}
+
+static char _mysql_get_blocking_operation__doc__[] =
+  "Returns NET_ASYNC_OP_READING or NET_ASYNC_OP_WRITING depending on if the\n"
+  "connection is waiting for data to be read or written.";
+
+static PyObject *
+_mysql_get_blocking_operation(
+	_mysql_ConnectionObject *self,
+	PyObject *args)
+{
+	if (!PyArg_ParseTuple(args, "")) return NULL;
+        return PyInt_FromLong(self->connection.net.async_blocking_state);
+}
+#endif
+
 static char _mysql_string_literal__doc__[] =
 "string_literal(obj) -- converts object obj into a SQL string literal.\n\
 This means, any special SQL characters are escaped, and it is enclosed\n\
@@ -1577,6 +1679,45 @@ _mysql__fetch_row(
 	return -1;
 }
 
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+/* Helper function for fetching rows.  Stores the row in r and status
+   in status.  A return of 0 means an error has been encounteres. */
+int
+_mysql__fetch_row_nonblocking(
+	_mysql_ResultObject *self,
+	PyObject **r,
+	net_async_status *status,
+	_PYFUNC *convert_row)
+{
+	MYSQL_ROW row;
+	PyObject *v;
+
+	*r = Py_None;
+	*status = mysql_fetch_row_nonblocking(self->result, &row);
+	if (*status == NET_ASYNC_NOT_READY) {
+	  return 1;
+	}
+
+	/* Got a row; return it. */
+	if (row) {
+	  v = convert_row(self, row);
+	  if (!v) {
+	    return 0;
+	  }
+	  *r = v;
+	  return 1;
+	}
+
+	/* No row means end of result set; either we hit an error or the last row */
+	if (mysql_errno(&(((_mysql_ConnectionObject *)(self->conn))->connection))) {
+	  _mysql_Exception((_mysql_ConnectionObject *)self->conn);
+	  return 0;
+	}
+
+	return 1;
+}
+#endif
+
 static char _mysql_ResultObject_fetch_row__doc__[] =
 "fetch_row([maxrows, how]) -- Fetches up to maxrows as a tuple.\n\
 The rows are formatted according to how:\n\
@@ -1645,6 +1786,61 @@ _mysql_ResultObject_fetch_row(
 	Py_XDECREF(r);
 	return NULL;
 }
+
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+static char _mysql_ResultObject_fetch_row_nonblocking__doc__[] =
+  "Fetch a row from the current query set in a non-blocking manner.\n"
+  "Returns a tuple of (status, row).  Keep calling this function to\n"
+  "retrieve all rows; when row is None, If status is NET_ASYNC_NOT_READY,\n"
+  "the descriptor should be waited on for more rows.  Otherwise, status\n"
+  "is NET_ASYNC_COMPLETE, and the query is complete.\n";
+
+static PyObject *
+_mysql_ResultObject_fetch_row_nonblocking(
+	_mysql_ResultObject *self,
+	PyObject *args,
+	PyObject *kwargs)
+{
+	typedef PyObject *_PYFUNC(_mysql_ResultObject *, MYSQL_ROW);
+	static char *kwlist[] = { "how", NULL };
+	static _PYFUNC *row_converters[] =
+	{
+		_mysql_row_to_tuple,
+		_mysql_row_to_dict,
+		_mysql_row_to_dict_old
+	};
+	_PYFUNC *convert_row;
+	unsigned int how=0;
+	PyObject *row=NULL, *ret=NULL;
+	net_async_status status;
+
+	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|i:fetch_row_nonblocking", kwlist,
+					 &how))
+	  goto error;
+	check_result_connection(self);
+	if (how < 0 || how >= sizeof(row_converters)) {
+		PyErr_SetString(PyExc_ValueError, "how out of range");
+		goto error;
+	}
+	convert_row = row_converters[how];
+
+	if (!(ret = PyTuple_New(2))) goto error;
+
+	if (!_mysql__fetch_row_nonblocking(self, &row, &status, convert_row)) {
+	  goto error;
+	}
+
+	Py_INCREF(row);
+	PyTuple_SET_ITEM(ret, 0, PyLong_FromLong(status));
+	PyTuple_SET_ITEM(ret, 1, row);
+	return ret;
+  error:
+	if (ret) {
+	  Py_XDECREF(ret);
+	}
+	return NULL;
+}
+#endif
 
 #if MYSQL_VERSION_ID >= 32303
 
@@ -2068,6 +2264,50 @@ _mysql_ConnectionObject_read_query_result(
 	return Py_None;
 }
 
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+static char _mysql_ConnectionObject_query_nonblocking__doc__[] = "derp";
+
+static PyObject *
+_mysql_ConnectionObject_query_nonblocking(
+	_mysql_ConnectionObject *self,
+	PyObject *args)
+{
+        int error;
+	Py_ssize_t len;
+	char *query_str;
+	PyObject *query;
+	net_async_status status;
+
+	if (!PyArg_ParseTuple(args, "|O", &query)) return NULL;
+	if (query && (PyString_Check(query) || PyUnicode_Check(query))) {
+	  if (self->current_nonblocking_query) {
+	    Py_DECREF(self->current_nonblocking_query);
+	  }
+	  if (!PyString_Check(query) && PyUnicode_Check(query)) {
+	    return NULL;
+	  }
+	  self->current_nonblocking_query = query;
+	  Py_INCREF(self->current_nonblocking_query);
+	}
+
+	check_connection(self);
+	if (PyString_AsStringAndSize(self->current_nonblocking_query, &query_str, &len) == -1) {
+	  return NULL;
+	}
+	status = mysql_real_query_nonblocking(&(self->connection), query_str, len, &error);
+
+	if (status == NET_ASYNC_COMPLETE) {
+	  Py_DECREF(self->current_nonblocking_query);
+	  self->current_nonblocking_query = NULL;
+
+	  if (error) {
+	    return _mysql_Exception(self);
+	  }
+	}
+	return PyInt_FromLong((int)status);
+}
+#endif
+
 static char _mysql_ConnectionObject_select_db__doc__[] =
 "Causes the database specified by db to become the default\n\
 (current) database on the connection specified by mysql. In subsequent\n\
@@ -2250,6 +2490,20 @@ _mysql_ConnectionObject_dealloc(
 		mysql_close(&(self->connection));
 		self->open = 0;
 	}
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+	if (self->current_nonblocking_username) {
+	  Py_DECREF(self->current_nonblocking_username);
+	}
+	if (self->current_nonblocking_password) {
+	  Py_DECREF(self->current_nonblocking_password);
+	}
+	if (self->current_nonblocking_host) {
+	  Py_DECREF(self->current_nonblocking_host);
+	}
+	if (self->current_nonblocking_dbname) {
+	  Py_DECREF(self->current_nonblocking_dbname);
+	}
+#endif
 	MyFree(self);
 }
 
@@ -2538,6 +2792,32 @@ static PyMethodDef _mysql_ConnectionObject_methods[] = {
 		METH_NOARGS,
 		_mysql_ConnectionObject_read_query_result__doc__,
 	},
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+	{
+		"get_file_descriptor",
+		(PyCFunction)_mysql_get_file_descriptor,
+		METH_VARARGS,
+		_mysql_get_file_descriptor__doc__
+	},
+	{
+		"get_blocking_operation",
+		(PyCFunction)_mysql_get_blocking_operation,
+		METH_VARARGS,
+		_mysql_get_blocking_operation__doc__
+	},
+	{
+		"query_nonblocking",
+		(PyCFunction)_mysql_ConnectionObject_query_nonblocking,
+		METH_VARARGS,
+		_mysql_ConnectionObject_query_nonblocking__doc__
+	},
+	{
+		"nonblocking_connect_run",
+		(PyCFunction)_mysql_nonblocking_connect_run,
+		METH_VARARGS,
+		_mysql_nonblocking_connect_run__doc__
+	},
+#endif
 	{
 		"select_db",
 		(PyCFunction)_mysql_ConnectionObject_select_db,
@@ -2652,6 +2932,14 @@ static PyMethodDef _mysql_ResultObject_methods[] = {
 		METH_VARARGS | METH_KEYWORDS,
 		_mysql_ResultObject_fetch_row__doc__
 	},
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+	{
+		"fetch_row_nonblocking",
+		(PyCFunction)_mysql_ResultObject_fetch_row_nonblocking,
+		METH_VARARGS | METH_KEYWORDS,
+		_mysql_ResultObject_fetch_row_nonblocking__doc__
+	},
+#endif
 	{
 		"field_flags",
 		(PyCFunction)_mysql_ResultObject_field_flags,
