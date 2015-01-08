@@ -54,6 +54,6 @@ def main(args):
     total_rows = 0
     for job in events:
         total_rows += job.value
-    print "%d total rows" % total_rows
+    print("%d total rows" % total_rows)
 
 main(sys.argv[1:])

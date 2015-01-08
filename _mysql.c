@@ -44,6 +44,8 @@ PERFORMANCE OF THIS SOFTWARE.
 #define PyInt_Check(n) PyLong_Check(n)
 #define PyInt_AS_LONG(n) PyLong_AS_LONG(n)
 #define PyString_FromString(s) PyUnicode_FromString(s)
+#define PyString_AsString(s) PyUnicode_AsUTF8(s)
+#define PyString_AsStringAndSize(s,p,n) PyBytes_AsStringAndSize(s,p,n)
 #endif
 
 #include "bytesobject.h"
@@ -279,11 +281,7 @@ static PyObject *_mysql_server_init(
 		cmd_args_c = (char **) PyMem_Malloc(cmd_argc*sizeof(char *));
 		for (i=0; i< cmd_argc; i++) {
 			item = PySequence_GetItem(cmd_args, i);
-#ifdef IS_PY3K
-			s = PyUnicode_AsUTF8(item);
-#else
 			s = PyString_AsString(item);
-#endif
 
 			Py_DECREF(item);
 			if (!s) {
@@ -309,11 +307,7 @@ static PyObject *_mysql_server_init(
 		groups_c = (char **) PyMem_Malloc((1+groupc)*sizeof(char *));
 		for (i=0; i< groupc; i++) {
 			item = PySequence_GetItem(groups, i);
-#ifdef IS_PY3K
-			s = PyUnicode_AsUTF8(item);
-#else
 			s = PyString_AsString(item);
-#endif
 			Py_DECREF(item);
 			if (!s) {
 				PyErr_SetString(PyExc_TypeError,
@@ -660,14 +654,25 @@ _mysql_ConnectionObject_Initialize(
 			      0);
 		PyObject *key, *value;
 		Py_ssize_t pos = 0;
+		int deckey, decvalue;
 		while (PyDict_Next(connection_attributes, &pos, &key, &value)) {
-			if ((PyString_Check(key) || PyUnicode_Check(key)) &&
-			    (PyString_Check(value) || PyUnicode_Check(value))) {
-				mysql_options4((&self->connection),
-					       MYSQL_OPT_CONNECT_ATTR_ADD,
-					       PyString_AsString(key),
-					       PyString_AsString(value));
+			deckey = decvalue = 0;
+			if (PyUnicode_Check(key)) {
+				key = PyUnicode_AsUTF8String(key);
+				deckey = 1;
 			}
+			if (PyUnicode_Check(value)) {
+				value = PyUnicode_AsUTF8String(value);
+				decvalue = 1;
+			}
+			if (PyBytes_Check(key) && PyBytes_Check(value)) {
+				mysql_options4((&self->connection),
+						   MYSQL_OPT_CONNECT_ATTR_ADD,
+						   PyBytes_AsString(key),
+						   PyBytes_AsString(value));
+			}
+			if (deckey) Py_DECREF(key);
+			if (decvalue) Py_DECREF(value);
 		}
 	}
 #endif
@@ -2279,15 +2284,16 @@ _mysql_ConnectionObject_query_nonblocking(
 	net_async_status status;
 
 	if (!PyArg_ParseTuple(args, "|O", &query)) return NULL;
-	if (query && (PyString_Check(query) || PyUnicode_Check(query))) {
+	if (query && (PyBytes_Check(query) || PyUnicode_Check(query))) {
 	  if (self->current_nonblocking_query) {
 	    Py_DECREF(self->current_nonblocking_query);
 	  }
-	  if (!PyString_Check(query) && PyUnicode_Check(query)) {
-	    return NULL;
+	  if (PyUnicode_Check(query)) {
+	    query = PyUnicode_AsUTF8String(query);  /* New REF */
+	  } else {
+		Py_INCREF(query);
 	  }
 	  self->current_nonblocking_query = query;
-	  Py_INCREF(self->current_nonblocking_query);
 	}
 
 	check_connection(self);
@@ -2978,11 +2984,7 @@ _mysql_ConnectionObject_getattro(
 	PyObject *name)
 {
 	char *cname;
-#ifdef IS_PY3K
-	cname = PyUnicode_AsUTF8(name);
-#else
 	cname = PyString_AsString(name);
-#endif
 	if (strcmp(cname, "closed") == 0)
 		return PyInt_FromLong((long)!(self->open));
 
