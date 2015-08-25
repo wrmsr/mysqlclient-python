@@ -1112,7 +1112,12 @@ _mysql_escape_string(
 	PyObject *str;
 	char *in, *out;
 	int len, size;
-	if (!PyArg_ParseTuple(args, "y#:escape_string", &in, &size)) return NULL;
+#ifdef IS_PY3K
+	static const char* format = "y#:escape_string";
+#else
+	static const char* format = "s#:escape_string";
+#endif
+	if (!PyArg_ParseTuple(args, format, &in, &size)) return NULL;
 	str = PyBytes_FromStringAndSize((char *) NULL, size*2+1);
 	if (!str) return PyErr_NoMemory();
 	out = PyBytes_AS_STRING(str);
